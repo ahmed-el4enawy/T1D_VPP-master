@@ -19,7 +19,10 @@ function [dataset, meta] = generate_population_dataset(varargin)
     p = inputParser;
     addParameter(p, 'member_id', 1, @(x) isnumeric(x) && x > 0);
     addParameter(p, 'total_members', 1, @(x) isnumeric(x) && x > 0);
-    addParameter(p, 'num_scenarios', 46200, @(x) isnumeric(x) && x > 0);
+    % [RECONSTRUCTION A1] Base scenario count inferred from 46,200 total / 5
+    % variants. The paper does not publish the exact pre-augmentation count;
+    % the true count depends on the rare-event supplement rate.
+    addParameter(p, 'num_scenarios', 9240, @(x) isnumeric(x) && x > 0);
     addParameter(p, 'variants_per_scenario', 5, @(x) isnumeric(x) && x > 0);
     addParameter(p, 'chunk_size', 250, @(x) isnumeric(x) && x > 0);
     addParameter(p, 'meal_csv_path', '', @ischar);
@@ -55,9 +58,38 @@ function [dataset, meta] = generate_population_dataset(varargin)
         end
     end
 
-    chunk_dir = sprintf('temp_part%d_chunks', member_id);
+    % [SAFETY FIX S1] Encode configuration fingerprint in chunk directory
+    % to prevent stale chunks from a different run being silently reused.
+    config_str = sprintf('s%d_v%d_d%d_r%d_seed%d', ...
+        opts.num_scenarios, opts.variants_per_scenario, ...
+        opts.days_per_scenario, opts.include_rare_events, opts.random_seed);
+    meal_info = dir(opts.meal_csv_path);
+    cgm_info  = dir(opts.cgm_csv_path);
+    hash_input = sprintf('%s_%d_%d', config_str, meal_info.bytes, cgm_info.bytes);
+    config_hash = dec2hex(mod(sum(double(hash_input) .* (1:numel(hash_input))), 2^32), 8);
+    chunk_dir = sprintf('temp_part%d_%s_chunks', member_id, config_hash);
     if ~exist(chunk_dir, 'dir')
         mkdir(chunk_dir);
+        % Save config manifest for verification on resume
+        chunk_config = struct('num_scenarios', opts.num_scenarios, ...
+            'variants_per_scenario', opts.variants_per_scenario, ...
+            'days_per_scenario', opts.days_per_scenario, ...
+            'include_rare_events', opts.include_rare_events, ...
+            'random_seed', opts.random_seed, ...
+            'meal_csv_bytes', meal_info.bytes, ...
+            'cgm_csv_bytes', cgm_info.bytes, ...
+            'config_hash', config_hash); %#ok<NASGU>
+        save(fullfile(chunk_dir, 'chunk_config.mat'), 'chunk_config');
+    else
+        % Verify config matches on resume
+        cfg_file = fullfile(chunk_dir, 'chunk_config.mat');
+        if isfile(cfg_file)
+            saved = load(cfg_file, 'chunk_config');
+            if ~strcmp(saved.chunk_config.config_hash, config_hash)
+                error('generate_population_dataset:staleChunks', ...
+                    'Chunk directory %s contains chunks from a different configuration. Delete it manually before rerunning.', chunk_dir);
+            end
+        end
     end
 
     member_seed = opts.random_seed + (member_id - 1) * 100000;
@@ -93,6 +125,27 @@ function [dataset, meta] = generate_population_dataset(varargin)
     meal_lib = load_day_scenario_library(opts.meal_csv_path);
     cgm_map  = load_midnight_cgm_stats(opts.cgm_csv_path);
     n_library = numel(meal_lib);
+
+    % [BUG FIX + RECONSTRUCTION A2] Day-level leakage-free split.
+    % Partition the set of ALL unique day_ids into disjoint train/val/test
+    % pools ONCE globally, BEFORE workload partitioning, so that every
+    % member uses the same mapping and no individual day_id leaks across
+    % splits. The paper says "60/20/20 split" but does not specify the
+    % grouping unit; standard ML practice requires no data leakage.
+    all_day_ids = unique([meal_lib.day_id]);
+    n_unique_days = numel(all_day_ids);
+    split_rng = RandStream('twister', 'Seed', opts.random_seed);
+    day_perm = all_day_ids(split_rng.randperm(n_unique_days));
+    n_train_days = round(opts.split_ratio(1) * n_unique_days);
+    n_val_days   = round(opts.split_ratio(2) * n_unique_days);
+    train_day_set = containers.Map(num2cell(double(day_perm(1:n_train_days))), ...
+                                   num2cell(ones(1, n_train_days)));
+    val_day_set   = containers.Map(num2cell(double(day_perm(n_train_days+1 : n_train_days+n_val_days))), ...
+                                   num2cell(ones(1, n_val_days)));
+    test_day_set  = containers.Map(num2cell(double(day_perm(n_train_days+n_val_days+1 : end))), ...
+                                   num2cell(ones(1, n_unique_days - n_train_days - n_val_days)));
+    fprintf('  Day-level split: %d train / %d val / %d test day_ids (of %d unique)\n', ...
+            n_train_days, n_val_days, n_unique_days - n_train_days - n_val_days, n_unique_days);
 
     %% --- 3. Population Model Parameters (Resalat et al. [12] / Hovorka et al. [35]) --
     ModPar = struct();
@@ -131,7 +184,8 @@ function [dataset, meta] = generate_population_dataset(varargin)
         c_start_scen = (c - 1) * chunk_size + 1;
         c_end_scen   = min(n_scenarios, c * chunk_size);
 
-        if isfile(chunk_file) || isfile(sprintf('chunk_%04d.mat', c))
+        % [SAFETY FIX S1] Only check inside the fingerprinted chunk_dir
+        if isfile(chunk_file)
             fprintf('  [Chunk %d/%d] Existing chunk found. Skipping...\n', c, num_chunks);
             continue;
         end
@@ -139,7 +193,9 @@ function [dataset, meta] = generate_population_dataset(varargin)
         t_start_chunk = tic;
         fprintf('  [Chunk %d/%d] Simulating scenarios %d..%d ...\n', c, num_chunks, c_start_scen, c_end_scen);
 
-        max_alloc = (c_end_scen - c_start_scen + 1) * n_variants * 2;
+        % [BUG FIX B1] Both rare-event conditions are independent (not
+        % elseif), so one trace can produce 1 normal + 1 hypo + 1 hyper = 3.
+        max_alloc = (c_end_scen - c_start_scen + 1) * n_variants * 3;
         
         X_cube      = zeros(N_steps, 10, max_alloc, 'single');
         U_cube      = zeros(N_steps, 2, max_alloc, 'single');
@@ -161,6 +217,10 @@ function [dataset, meta] = generate_population_dataset(varargin)
             day_indices = randi(n_library, 1, opts.days_per_scenario);
             selected_days = meal_lib(day_indices);
             day_ids = int16([selected_days.day_id]);
+            % [RECONSTRUCTION A3] When the 7 sampled days come from different
+            % participants, the initial glucose distribution is drawn from
+            % the first day's participant. The paper does not specify which
+            % participant's midnight CGM to use in this case.
             usubjid_str = string(selected_days(1).usubjid);
 
             if cgm_map.isKey(char(usubjid_str))
@@ -173,6 +233,8 @@ function [dataset, meta] = generate_population_dataset(varargin)
             end
 
             initial_cgm_draws = cgm_mean + cgm_std * randn(1, n_variants);
+            % [RECONSTRUCTION A6] The paper does not mention clipping.
+            % This bounds the normal distribution to [70, 260] mg/dL.
             initial_cgm_draws = max(70, min(260, initial_cgm_draws));
 
             for v_idx = 1:n_variants
@@ -181,6 +243,9 @@ function [dataset, meta] = generate_population_dataset(varargin)
                 [x0, ~, basal_Uhr] = solve_steady_state(g0, ModPar);
 
                 tdd_est = basal_Uhr * 24.0 * 2.0;
+                % [RECONSTRUCTION A4] The paper says "1700 rule" which in
+                % clinical practice refers to ISF, not ICR. The /3 divisor
+                % approximates a 500-rule ICR. This is undocumented.
                 icr_base = 1700.0 / (tdd_est * 3.0);
 
                 [u_carbs_grid, u_insulin_grid] = build_scenario_inputs(...
@@ -209,6 +274,10 @@ function [dataset, meta] = generate_population_dataset(varargin)
                 rare_vec(trace_count)       = false;
 
                 if opts.include_rare_events
+                    % [RECONSTRUCTION A7] The paper specifies only TBR > 20%
+                    % and TAR250 > 40% as supplement triggers. The perturbation
+                    % method (initial glucose scaling, insulin scaling, basal
+                    % scaling, forced delays) is undocumented.
                     if tbr > 20
                         [x0_hypo, ~, basal_hypo] = solve_steady_state(g0 * 0.85, ModPar);
                         [X_supp, U_supp, CGM_supp] = simulate_7day_ode_fast(...
@@ -292,15 +361,15 @@ function [dataset, meta] = generate_population_dataset(varargin)
     end
     n_files = numel(chunk_files);
 
-    % ---- Pass 1: Scan chunk metadata (group IDs, metrics, trace counts) ----
+    % ---- Pass 1: Scan chunk metadata (trace counts, metrics, day_ids) ----
     chunk_counts   = zeros(1, n_files);
-    all_group_keys = {};
     all_tir        = [];
     all_tar        = [];
     all_tbr        = [];
     all_mg         = [];
+    all_day_ids_chunks = {};
 
-    fprintf('  Pass 1/2: scanning chunk metadata for group splitting ...\n');
+    fprintf('  Pass 1/2: scanning chunk metadata for day-level splitting ...\n');
     for k = 1:n_files
         cpath = get_chunk_file_path(chunk_dir, chunk_files(k).name);
         info = whos('-file', cpath, 'CGM_mat');
@@ -314,13 +383,11 @@ function [dataset, meta] = generate_population_dataset(varargin)
         chunk_counts(k) = cnt;
 
         cdata = load(cpath, 'day_ids_mat', 'tir_vec', 'tar_vec', 'tbr_vec', 'mg_vec');
-        for j = 1:cnt
-            all_group_keys{end+1} = sprintf('%d_', sort(cdata.day_ids_mat(:, j))); %#ok<AGROW>
-        end
-        all_tir = [all_tir, cdata.tir_vec]; %#ok<AGROW>
-        all_tar = [all_tar, cdata.tar_vec]; %#ok<AGROW>
-        all_tbr = [all_tbr, cdata.tbr_vec]; %#ok<AGROW>
-        all_mg  = [all_mg,  cdata.mg_vec];  %#ok<AGROW>
+        all_day_ids_chunks{k} = cdata.day_ids_mat(:, 1:cnt); %#ok<AGROW>
+        all_tir = [all_tir, cdata.tir_vec(1:cnt)]; %#ok<AGROW>
+        all_tar = [all_tar, cdata.tar_vec(1:cnt)]; %#ok<AGROW>
+        all_tbr = [all_tbr, cdata.tbr_vec(1:cnt)]; %#ok<AGROW>
+        all_mg  = [all_mg,  cdata.mg_vec(1:cnt)];  %#ok<AGROW>
         clear cdata;
     end
 
@@ -328,22 +395,33 @@ function [dataset, meta] = generate_population_dataset(varargin)
     total_traces   = n_total_traces;
     total_sim_days = total_traces * opts.days_per_scenario;
 
-    % ---- Leakage-Free Group Splitting (60% Train / 20% Val / 20% Test) ----
-    [unique_groups, ~, group_indices] = unique(all_group_keys);
-    n_unique_groups = numel(unique_groups);
-
-    perm = randperm(n_unique_groups);
-    n_train_g = round(opts.split_ratio(1) * n_unique_groups);
-    n_val_g   = round(opts.split_ratio(2) * n_unique_groups);
-
-    train_groups = perm(1:n_train_g);
-    val_groups   = perm(n_train_g+1 : n_train_g+n_val_g);
-    test_groups  = perm(n_train_g+n_val_g+1 : end);
-
+    % ---- [RECONSTRUCTION A2] Day-Level Leakage-Free Splitting ----
+    % Each trace is assigned to the split that contains ALL of its 7 day_ids.
+    % If a trace's day_ids span multiple splits, it goes to TRAIN (the most
+    % conservative choice, preventing contamination of val/test).
     split_labels = zeros(1, n_total_traces, 'uint8');  % 1=train, 2=val, 3=test
-    split_labels(ismember(group_indices, train_groups)) = 1;
-    split_labels(ismember(group_indices, val_groups))   = 2;
-    split_labels(ismember(group_indices, test_groups))  = 3;
+    trace_offset = 0;
+    for k = 1:n_files
+        cnt = chunk_counts(k);
+        chunk_days = all_day_ids_chunks{k};
+        for j = 1:cnt
+            ids = double(chunk_days(:, j));
+            in_train = all(cellfun(@(id) train_day_set.isKey(id), num2cell(ids)));
+            in_val   = all(cellfun(@(id) val_day_set.isKey(id), num2cell(ids)));
+            in_test  = all(cellfun(@(id) test_day_set.isKey(id), num2cell(ids)));
+            if in_test
+                split_labels(trace_offset + j) = 3;
+            elseif in_val
+                split_labels(trace_offset + j) = 2;
+            elseif in_train
+                split_labels(trace_offset + j) = 1;
+            else
+                % Mixed day_ids across splits → assign to train
+                split_labels(trace_offset + j) = 1;
+            end
+        end
+        trace_offset = trace_offset + cnt;
+    end
 
     n_train = sum(split_labels == 1);
     n_val   = sum(split_labels == 2);
