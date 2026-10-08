@@ -51,6 +51,14 @@ function meal_lib = load_day_scenario_library(csv_path)
             error('load_day_scenario_library:nonPositiveCarb', ...
                   'Row %d has a non-positive carb value in carb_grams.', i);
         end
+        if numel(cg_vals) ~= meal_lib(i).num_meals
+            error('load_day_scenario_library:lengthMismatch', ...
+                  'Row %d: numel(carb_grams) does not match num_meals.', i);
+        end
+        if any(~isfinite(cg_vals))
+            error('load_day_scenario_library:nonFiniteCarb', ...
+                  'Row %d: carb_grams contains non-finite values.', i);
+        end
         meal_lib(i).carb_grams = cg_vals(:)';
 
         % Parse semicolon-delimited time_min
@@ -60,6 +68,18 @@ function meal_lib = load_day_scenario_library(csv_path)
         if any(isnan(tm_vals))
             error('load_day_scenario_library:parseError', ...
                   'Row %d: could not parse time_min "%s".', i, tm_str);
+        end
+        if numel(tm_vals) ~= meal_lib(i).num_meals
+            error('load_day_scenario_library:lengthMismatch', ...
+                  'Row %d: numel(time_min) does not match num_meals.', i);
+        end
+        if any(tm_vals < 0 | tm_vals >= 1440)
+            error('load_day_scenario_library:invalidTime', ...
+                  'Row %d: time_min contains values out of bounds [0, 1440).', i);
+        end
+        if any(~isfinite(tm_vals))
+            error('load_day_scenario_library:nonFiniteTime', ...
+                  'Row %d: time_min contains non-finite values.', i);
         end
         meal_lib(i).time_min = tm_vals(:)';
     end

@@ -21,8 +21,9 @@ function [dataset, meta] = generate_population_dataset(varargin)
     addParameter(p, 'total_members', 1, @(x) isnumeric(x) && x > 0);
     % [RECONSTRUCTION A1] Base scenario count inferred from 46,200 total / 5
     % variants. The paper does not publish the exact pre-augmentation count;
-    % the true count depends on the rare-event supplement rate.
-    addParameter(p, 'num_scenarios', 9240, @(x) isnumeric(x) && x > 0);
+    % the true count depends on the rare-event supplement rate. We use 46200 
+    % as the default requested base-scenario count and rely on explicit accounting.
+    addParameter(p, 'num_scenarios', 46200, @(x) isnumeric(x) && x > 0);
     addParameter(p, 'variants_per_scenario', 5, @(x) isnumeric(x) && x > 0);
     addParameter(p, 'chunk_size', 250, @(x) isnumeric(x) && x > 0);
     addParameter(p, 'meal_csv_path', '', @ischar);
@@ -58,14 +59,40 @@ function [dataset, meta] = generate_population_dataset(varargin)
         end
     end
 
+    %% --- 2. Load T1DEXI Meal Scenarios and Midnight CGM Stats -------------
+    if isempty(opts.meal_csv_path)
+        if isfile('day_scenario_library.csv')
+            opts.meal_csv_path = 'day_scenario_library.csv';
+        elseif isfile('day_scenario_library (1).csv')
+            opts.meal_csv_path = 'day_scenario_library (1).csv';
+        else
+            error('generate_population_dataset:missingFile', 'day_scenario_library.csv not found.');
+        end
+    end
+
+    if isempty(opts.cgm_csv_path)
+        if isfile('midnight_cgm_stats.csv')
+            opts.cgm_csv_path = 'midnight_cgm_stats.csv';
+        elseif isfile('midnight_cgm_stats (1).csv')
+            opts.cgm_csv_path = 'midnight_cgm_stats (1).csv';
+        else
+            error('generate_population_dataset:missingFile', 'midnight_cgm_stats.csv not found.');
+        end
+    end
+
     % [SAFETY FIX S1] Encode configuration fingerprint in chunk directory
     % to prevent stale chunks from a different run being silently reused.
-    config_str = sprintf('s%d_v%d_d%d_r%d_seed%d', ...
+    config_str = sprintf('s%d_v%d_d%d_dt%d_r%d_seed%d_split%.2f_tm%d', ...
         opts.num_scenarios, opts.variants_per_scenario, ...
-        opts.days_per_scenario, opts.include_rare_events, opts.random_seed);
+        opts.days_per_scenario, opts.dt, opts.include_rare_events, ...
+        opts.random_seed, opts.split_ratio(1), total_members);
     meal_info = dir(opts.meal_csv_path);
     cgm_info  = dir(opts.cgm_csv_path);
-    hash_input = sprintf('%s_%d_%d', config_str, meal_info.bytes, cgm_info.bytes);
+    
+    % Include file sizes and datenums to approximate a hash of the files
+    hash_input = sprintf('%s_mb%d_md%f_cb%d_cd%f', config_str, ...
+        meal_info.bytes, meal_info.datenum, cgm_info.bytes, cgm_info.datenum);
+        
     config_hash = dec2hex(mod(sum(double(hash_input) .* (1:numel(hash_input))), 2^32), 8);
     chunk_dir = sprintf('temp_part%d_%s_chunks', member_id, config_hash);
     if ~exist(chunk_dir, 'dir')
@@ -74,10 +101,15 @@ function [dataset, meta] = generate_population_dataset(varargin)
         chunk_config = struct('num_scenarios', opts.num_scenarios, ...
             'variants_per_scenario', opts.variants_per_scenario, ...
             'days_per_scenario', opts.days_per_scenario, ...
+            'dt', opts.dt, ...
             'include_rare_events', opts.include_rare_events, ...
             'random_seed', opts.random_seed, ...
+            'split_ratio', opts.split_ratio, ...
+            'total_members', total_members, ...
             'meal_csv_bytes', meal_info.bytes, ...
+            'meal_csv_datenum', meal_info.datenum, ...
             'cgm_csv_bytes', cgm_info.bytes, ...
+            'cgm_csv_datenum', cgm_info.datenum, ...
             'config_hash', config_hash); %#ok<NASGU>
         save(fullfile(chunk_dir, 'chunk_config.mat'), 'chunk_config');
     else
@@ -101,26 +133,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
     fprintf(' Output File     : %s\n', opts.save_path);
     fprintf('========================================================================\n');
 
-    %% --- 2. Load T1DEXI Meal Scenarios and Midnight CGM Stats -------------
-    if isempty(opts.meal_csv_path)
-        if isfile('day_scenario_library.csv')
-            opts.meal_csv_path = 'day_scenario_library.csv';
-        elseif isfile('day_scenario_library (1).csv')
-            opts.meal_csv_path = 'day_scenario_library (1).csv';
-        else
-            error('generate_population_dataset:missingFile', 'day_scenario_library.csv not found.');
-        end
-    end
-
-    if isempty(opts.cgm_csv_path)
-        if isfile('midnight_cgm_stats.csv')
-            opts.cgm_csv_path = 'midnight_cgm_stats.csv';
-        elseif isfile('midnight_cgm_stats (1).csv')
-            opts.cgm_csv_path = 'midnight_cgm_stats (1).csv';
-        else
-            error('generate_population_dataset:missingFile', 'midnight_cgm_stats.csv not found.');
-        end
-    end
+    %% --- 2. Build Memory and Pools ----------------------------------------
 
     meal_lib = load_day_scenario_library(opts.meal_csv_path);
     cgm_map  = load_midnight_cgm_stats(opts.cgm_csv_path);
@@ -223,8 +236,28 @@ function [dataset, meta] = generate_population_dataset(varargin)
 
         for s_idx = c_start_scen:c_end_scen
             global_scen_id = start_scen_idx + s_idx - 1;
+            
+            % Must guarantee it's within bounds
+            if global_scen_id < 1 || global_scen_id > opts.num_scenarios
+                error('generate_population_dataset:invalidScenId', ...
+                      'global_scen_id %d is out of bounds [1, %d]', global_scen_id, opts.num_scenarios);
+            end
 
-            day_indices = randi(n_library, 1, opts.days_per_scenario);
+            split_lbl = base_scen_split(global_scen_id);
+            
+            switch split_lbl
+                case 1
+                    pool_idx = train_pool_idx;
+                case 2
+                    pool_idx = val_pool_idx;
+                case 3
+                    pool_idx = test_pool_idx;
+                otherwise
+                    error('generate_population_dataset:invalidSplitLbl', ...
+                          'Undefined split_lbl %d', split_lbl);
+            end
+
+            day_indices = pool_idx(randi(numel(pool_idx), 1, opts.days_per_scenario));
             selected_days = meal_lib(day_indices);
             day_ids = int16([selected_days.day_id]);
             % [RECONSTRUCTION A3] When the 7 sampled days come from different
@@ -331,6 +364,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
                         tir_vec(trace_count)        = single(mean(CGM_supp >= 70 & CGM_supp <= 180) * 100);
                         mg_vec(trace_count)         = single(mean(CGM_supp));
                         rare_vec(trace_count)       = true;
+                        split_vec(trace_count)      = split_lbl;
                     end
                 end
             end
@@ -434,6 +468,10 @@ function [dataset, meta] = generate_population_dataset(varargin)
     end
     if ~isempty(intersect(val_days_used, test_days_used))
         error('LEAKAGE DETECTED: Val and Test sets share daily scenarios!');
+    end
+    
+    if any(split_labels < 1 | split_labels > 3)
+        error('LEAKAGE DETECTED: Some traces have an invalid or missing split_label!');
     end
     fprintf('  Hard Assertions Passed: Zero leakage between splits.\n');
 
