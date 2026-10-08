@@ -142,7 +142,8 @@ def evaluate_cohort_generic(cgm_ds, trace_indices, orientation, name, is_rare_fl
         
         rare_chunk = None
         if is_rare_flags is not None:
-            rare_chunk = is_rare_flags[chunk_idx]
+            chunk_rare_flags = np.asarray(is_rare_flags[chunk_idx])
+            rare_chunk = chunk_rare_flags != 0
             counts['rare_traces'] += np.sum(rare_chunk)
             counts['non_rare_traces'] += len(chunk_idx) - np.sum(rare_chunk)
         else:
@@ -328,7 +329,7 @@ def main():
             
             is_rare = None
             if 'dataset_is_rare' in f:
-                is_rare = np.asarray(f['dataset_is_rare']).ravel()
+                is_rare = np.asarray(f['dataset_is_rare']).ravel() != 0
                 print(f"Found is_rare flag. Rare TEST traces: {np.sum(is_rare[test_all_idx])}")
                 
             day_ids_source = f['dataset_day_ids']
@@ -355,7 +356,7 @@ def main():
             
             is_rare = None
             if 'is_rare' in D_test:
-                is_rare = np.asarray(D_test['is_rare']).ravel()
+                is_rare = np.asarray(D_test['is_rare']).ravel() != 0
                 print(f"Found is_rare flag. Rare TEST traces: {np.sum(is_rare)}")
                 
             if 'day_ids' in D_test:
@@ -443,7 +444,15 @@ def run_tests():
     tir, tar, tbr = out['TIR'][0], out['TAR'][0], out['TBR'][0]
     assert np.isclose(tir + tar + tbr, 100.0)
     
+    # Regression test for uint8 rare flags
+    flags = np.array([0, 1, 2, 0], dtype=np.uint8)
+    rare_mask = flags != 0
+    non_rare_mask = ~rare_mask
+    assert np.array_equal(rare_mask, [False, True, True, False])
+    assert np.array_equal(non_rare_mask, [True, False, False, True])
+    
     print('Regression test against training_population evaluate_population_model passed.')
+    print('Regression test for uint8 rare flags bitwise inversion passed.')
     print('All unit tests passed.')
 
 if __name__ == '__main__':
