@@ -478,6 +478,8 @@ function [dataset, meta] = generate_population_dataset(varargin)
     end
 
     chunk_files = dir(fullfile(chunk_dir, 'chunk_*.mat'));
+    % Filter out chunk_config.mat
+    chunk_files = chunk_files(~strcmp({chunk_files.name}, 'chunk_config.mat'));
     if isempty(chunk_files)
         error('No chunks found in %s', chunk_dir);
     end
