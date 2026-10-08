@@ -570,20 +570,34 @@ function [dataset, meta] = generate_population_dataset(varargin)
 
     % ---- ACCOUNTING METADATA ----
     base_scenarios           = numel(unique(global_gids));
-    standard_variant_traces  = sum(~rare_labels);
-    supplemental_rare_traces = sum(rare_labels);
+    standard_variant_traces  = sum(rare_labels == 0);
+    hypo_supplement_traces   = sum(rare_labels == 1);
+    hyper_supplement_traces  = sum(rare_labels == 2);
+    supplemental_rare_traces_total = hypo_supplement_traces + hyper_supplement_traces;
     final_total_traces       = numel(rare_labels);
+    
+    % Assertions
+    assert(standard_variant_traces == base_scenarios * opts.variants_per_scenario, ...
+        'Accounting mismatch: standard variants != base_scenarios * variants_per_scenario');
+    assert(final_total_traces == standard_variant_traces + supplemental_rare_traces_total, ...
+        'Accounting mismatch: final total != standard + supplemental');
     
     fprintf('  Accounting:\n');
     fprintf('    Requested Base Scenarios : %d\n', opts.num_scenarios);
     fprintf('    Generated Base Scenarios : %d\n', base_scenarios);
     fprintf('    Standard Variant Traces  : %d\n', standard_variant_traces);
-    fprintf('    Supplemental Rare Traces : %d\n', supplemental_rare_traces);
+    fprintf('    Hypo Supplement Traces   : %d\n', hypo_supplement_traces);
+    fprintf('    Hyper Supplement Traces  : %d\n', hyper_supplement_traces);
+    fprintf('    Total Supplemental Rare  : %d\n', supplemental_rare_traces_total);
     fprintf('    FINAL TOTAL TRACES       : %d\n', final_total_traces);
     
     n_train = sum(split_labels == 1);
     n_val   = sum(split_labels == 2);
     n_test  = sum(split_labels == 3);
+    
+    assert(final_total_traces == n_train + n_val + n_test, ...
+        'Accounting mismatch: final total != train + val + test');
+    
     fprintf('  Split: %d train (%.1f%%) / %d val (%.1f%%) / %d test (%.1f%%)\n', ...
             n_train, 100*n_train/n_total_traces, n_val, 100*n_val/n_total_traces, n_test, 100*n_test/n_total_traces);
 
@@ -754,14 +768,17 @@ function [dataset, meta] = generate_population_dataset(varargin)
     meta.num_scenarios  = n_scenarios;
     meta.base_scenarios = base_scenarios;
     meta.standard_variant_traces = standard_variant_traces;
-    meta.supplemental_rare_traces = supplemental_rare_traces;
+    meta.hypo_supplement_traces = hypo_supplement_traces;
+    meta.hyper_supplement_traces = hyper_supplement_traces;
+    meta.supplemental_rare_traces_total = supplemental_rare_traces_total;
     meta.final_total_traces = final_total_traces;
-    meta.n_train = n_train;
-    meta.n_val   = n_val;
-    meta.n_test  = n_test;
+    meta.train_count = n_train;
+    meta.val_count   = n_val;
+    meta.test_count  = n_test;
     meta.total_simulated_days = total_sim_days;
     meta.fallback_cgm_count = total_fallback_cgm;
     meta.mixed_participant_count = total_mixed_participants;
+    meta.repeated_day_count = total_repeated_days;
     
     if total_fallback_cgm > 0
         warning('generate_population_dataset:cgmFallback', ...
@@ -806,7 +823,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
     end
 
     fprintf('========================================================================\n');
-    fprintf(' Part %d Generation Complete. Ready for Model Training!\n', member_id);
+    fprintf(' Part %d Generation Complete.\n', member_id);
     fprintf('========================================================================\n');
 end
 
