@@ -29,7 +29,6 @@ function [dataset, meta] = generate_population_dataset(varargin)
     addParameter(p, 'dt', 5, @(x) isnumeric(x) && x > 0);
     addParameter(p, 'days_per_scenario', 7, @(x) isnumeric(x) && x > 0);
     addParameter(p, 'include_rare_events', true, @islogical);
-    addParameter(p, 'output_mode', 'pilot_struct', @ischar);
     addParameter(p, 'random_seed', 42, @isnumeric);
     parse(p, varargin{:});
     opts = p.Results;
@@ -229,28 +228,10 @@ function [dataset, meta] = generate_population_dataset(varargin)
         c_end_scen   = min(n_scenarios, c * chunk_size);
 
         % [SAFETY FIX S1] Only check inside the fingerprinted chunk_dir
-
         if isfile(chunk_file)
-            try
-                % Load only lightweight metadata to verify
-                mdata = load(chunk_file, 'config_hash', 'member_id', 'total_members', 'chunk_index', ...
-                    'gid_vec', 'split_vec', 'rare_type_vec', 'day_ids_mat');
-                
-                % Check if variables exist
-                info = whos('-file', chunk_file);
-                names = {info.name};
-                req_vars = {'X_cube', 'U_cube', 'CGM_mat', 'day_ids_mat', 'gid_vec', 'split_vec', 'rare_type_vec'};
-                if ~all(ismember(req_vars, names))
-                    error('generate_population_dataset:missingVars', 'Chunk %s is missing required variables.', chunk_file);
-                end
-                
-                fprintf('  [Chunk %d/%d] Existing valid chunk found. Skipping...\n', c, num_chunks);
-                continue;
-            catch ME
-                error('generate_population_dataset:corruptChunk', 'Chunk %s failed validation: %s', chunk_file, ME.message);
-            end
+            fprintf('  [Chunk %d/%d] Existing chunk found. Skipping...\n', c, num_chunks);
+            continue;
         end
-
 
         t_start_chunk = tic;
         fprintf('  [Chunk %d/%d] Simulating scenarios %d..%d ...\n', c, num_chunks, c_start_scen, c_end_scen);
@@ -269,13 +250,12 @@ function [dataset, meta] = generate_population_dataset(varargin)
         tar_vec     = zeros(1, max_alloc, 'single');
         tir_vec     = zeros(1, max_alloc, 'single');
         mg_vec      = zeros(1, max_alloc, 'single');
-        rare_type_vec = zeros(1, max_alloc, 'uint8');
+        rare_vec    = false(1, max_alloc);
         split_vec   = zeros(1, max_alloc, 'uint8');
 
         trace_count = 0;
         fallback_cgm_count = 0;
         mixed_participant_count = 0;
-        repeated_day_count = 0;
 
         for s_idx = c_start_scen:c_end_scen
             global_scen_id = start_scen_idx + s_idx - 1;
@@ -366,7 +346,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
                 tar_vec(trace_count)        = single(tar);
                 tir_vec(trace_count)        = single(tir);
                 mg_vec(trace_count)         = single(mean_cgm);
-                rare_type_vec(trace_count)       = 0;
+                rare_vec(trace_count)       = false;
                 split_vec(trace_count)      = split_lbl;
 
                 if opts.include_rare_events
@@ -391,7 +371,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
                         tar_vec(trace_count)        = single(mean(CGM_supp > 180) * 100);
                         tir_vec(trace_count)        = single(mean(CGM_supp >= 70 & CGM_supp <= 180) * 100);
                         mg_vec(trace_count)         = single(mean(CGM_supp));
-                        rare_type_vec(trace_count)       = 1;
+                        rare_vec(trace_count)       = true;
                         split_vec(trace_count)      = split_lbl;
                     end
 
@@ -415,7 +395,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
                         tar_vec(trace_count)        = single(mean(CGM_supp > 180) * 100);
                         tir_vec(trace_count)        = single(mean(CGM_supp >= 70 & CGM_supp <= 180) * 100);
                         mg_vec(trace_count)         = single(mean(CGM_supp));
-                        rare_type_vec(trace_count)       = 2;
+                        rare_vec(trace_count)       = true;
                         split_vec(trace_count)      = split_lbl;
                     end
                 end
@@ -423,12 +403,6 @@ function [dataset, meta] = generate_population_dataset(varargin)
         end
 
         chunk_pack = struct();
-
-        chunk_pack.config_hash = config_hash_full;
-        chunk_pack.member_id = member_id;
-        chunk_pack.total_members = total_members;
-        chunk_pack.chunk_index = c;
-
         chunk_pack.X_cube      = X_cube(:, :, 1:trace_count);
         chunk_pack.U_cube      = U_cube(:, :, 1:trace_count);
         chunk_pack.CGM_mat     = CGM_mat(:, 1:trace_count);
@@ -439,26 +413,15 @@ function [dataset, meta] = generate_population_dataset(varargin)
         chunk_pack.tar_vec     = tar_vec(1:trace_count);
         chunk_pack.tir_vec     = tir_vec(1:trace_count);
         chunk_pack.mg_vec      = mg_vec(1:trace_count);
-        chunk_pack.rare_type_vec = rare_type_vec(1:trace_count);
+        chunk_pack.rare_vec    = rare_vec(1:trace_count);
         chunk_pack.split_vec   = split_vec(1:trace_count);
         chunk_pack.fallback_cgm_count = fallback_cgm_count;
         chunk_pack.mixed_participant_count = mixed_participant_count;
-        chunk_pack.repeated_day_count = repeated_day_count;
-
 
         % Use temporary extension then atomic move
         tmp_chunk_file = [chunk_file, '.tmp.mat'];
         save(tmp_chunk_file, '-struct', 'chunk_pack', '-v7');
-        
-        % Validate written file
-        try
-            vt = load(tmp_chunk_file, 'config_hash');
-        catch
-            delete(tmp_chunk_file);
-            error('generate_population_dataset:saveError', 'Failed to save or read temp chunk file %s', tmp_chunk_file);
-        end
-        movefile(tmp_chunk_file, chunk_file, 'f');
-
+        movefile(tmp_chunk_file, chunk_file);
         t_chunk = toc(t_start_chunk);
 
         fprintf('     Saved Chunk %d in %.1fs (%d traces, ~35 MB). RAM cleared.\n', ...
@@ -466,7 +429,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
         clear X_cube U_cube CGM_mat day_ids_mat usubjid_arr chunk_pack;
     end
 
-    %% --- 6. Assemble Output -------
+    %% --- 6. Assemble into ONE Single .mat File (Peak RAM < 3.5 GB) -------
     fprintf('\nStitching completed chunks into ONE single file: %s ...\n', opts.save_path);
 
     % Disable MATLAB array size preference that threw the 5.0GB error
@@ -478,7 +441,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
 
     chunk_files = dir(fullfile(chunk_dir, 'chunk_*.mat'));
     if isempty(chunk_files)
-        error('No chunks found in %s', chunk_dir);
+        chunk_files = dir('chunk_*.mat');
     end
     n_files = numel(chunk_files);
 
@@ -490,12 +453,11 @@ function [dataset, meta] = generate_population_dataset(varargin)
     all_mg         = [];
     all_day_ids_chunks = {};
     all_split_lbls = {};
-    all_rare_type_vec = {};
+    all_rare_vec   = {};
     all_gid_vec    = {};
     
     total_fallback_cgm = 0;
     total_mixed_participants = 0;
-    total_repeated_days = 0;
 
     fprintf('  Pass 1/2: scanning chunk metadata for validation ...\n');
     for k = 1:n_files
@@ -510,22 +472,18 @@ function [dataset, meta] = generate_population_dataset(varargin)
         end
         chunk_counts(k) = cnt;
 
-        cdata = load(cpath, 'day_ids_mat', 'tir_vec', 'tar_vec', 'tbr_vec', 'mg_vec', 'split_vec', 'rare_type_vec', 'gid_vec', 'fallback_cgm_count', 'mixed_participant_count');
+        cdata = load(cpath, 'day_ids_mat', 'tir_vec', 'tar_vec', 'tbr_vec', 'mg_vec', 'split_vec', 'rare_vec', 'gid_vec', 'fallback_cgm_count', 'mixed_participant_count');
         
-
         if isfield(cdata, 'fallback_cgm_count')
             total_fallback_cgm = total_fallback_cgm + cdata.fallback_cgm_count;
         end
         if isfield(cdata, 'mixed_participant_count')
             total_mixed_participants = total_mixed_participants + cdata.mixed_participant_count;
         end
-        if isfield(cdata, 'repeated_day_count')
-            total_repeated_days = total_repeated_days + cdata.repeated_day_count;
-        end
         
         all_day_ids_chunks{k} = cdata.day_ids_mat(:, 1:cnt); %#ok<AGROW>
         all_split_lbls{k} = cdata.split_vec(1:cnt); %#ok<AGROW>
-        all_rare_type_vec{k} = cdata.rare_type_vec(1:cnt); %#ok<AGROW>
+        all_rare_vec{k}   = cdata.rare_vec(1:cnt); %#ok<AGROW>
         all_gid_vec{k}    = cdata.gid_vec(1:cnt); %#ok<AGROW>
         
         all_tir = [all_tir, cdata.tir_vec(1:cnt)]; %#ok<AGROW>
@@ -541,7 +499,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
 
     % Concatenate metadata
     split_labels = [all_split_lbls{:}];
-    rare_labels  = [all_rare_type_vec{:}];
+    rare_labels  = [all_rare_vec{:}];
     global_gids  = [all_gid_vec{:}];
     day_ids_flat = cat(2, all_day_ids_chunks{:});
 
@@ -653,7 +611,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
             D_train.tar(rng_tr)       = cdata.tar_vec(tr_mask);
             D_train.tbr(rng_tr)       = cdata.tbr_vec(tr_mask);
             D_train.mean_cgm(rng_tr)  = cdata.mg_vec(tr_mask);
-            D_train.is_rare(rng_tr)   = cdata.rare_type_vec(tr_mask);
+            D_train.is_rare(rng_tr)   = cdata.rare_vec(tr_mask);
             if isfield(cdata, 'usubjid_arr')
                 D_train.usubjid(rng_tr) = cdata.usubjid_arr(tr_mask);
             end
@@ -673,7 +631,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
             D_val.tar(rng_va)       = cdata.tar_vec(va_mask);
             D_val.tbr(rng_va)       = cdata.tbr_vec(va_mask);
             D_val.mean_cgm(rng_va)  = cdata.mg_vec(va_mask);
-            D_val.is_rare(rng_va)   = cdata.rare_type_vec(va_mask);
+            D_val.is_rare(rng_va)   = cdata.rare_vec(va_mask);
             if isfield(cdata, 'usubjid_arr')
                 D_val.usubjid(rng_va) = cdata.usubjid_arr(va_mask);
             end
@@ -693,7 +651,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
             D_test.tar(rng_te)       = cdata.tar_vec(te_mask);
             D_test.tbr(rng_te)       = cdata.tbr_vec(te_mask);
             D_test.mean_cgm(rng_te)  = cdata.mg_vec(te_mask);
-            D_test.is_rare(rng_te)   = cdata.rare_type_vec(te_mask);
+            D_test.is_rare(rng_te)   = cdata.rare_vec(te_mask);
             if isfield(cdata, 'usubjid_arr')
                 D_test.usubjid(rng_te) = cdata.usubjid_arr(te_mask);
             end
