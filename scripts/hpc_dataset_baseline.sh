@@ -27,7 +27,7 @@ if [ ! -f "$DATASET_PATH" ]; then
 fi
 
 echo "Evaluating dataset: $DATASET_PATH"
-python dataset_baseline.py --dataset "$DATASET_PATH" --cohort all
+python scripts/dataset_baseline.py --dataset "$DATASET_PATH" --cohort all
 
 echo "Statistical fingerprinting dataset: $DATASET_PATH"
 python dataset_fingerprint.py --dataset_path "$DATASET_PATH"

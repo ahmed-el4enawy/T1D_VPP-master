@@ -1,3 +1,4 @@
+addpath('../../matlab');
 % test_sample.m
 % Lightweight pilot runner for the population dataset generator.
 

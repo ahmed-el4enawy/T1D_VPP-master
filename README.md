@@ -1,33 +1,70 @@
-# T1D Virtual Patient Population (T1D_VPP) Dataset Generator
+# T1D Virtual Patient Population Dataset Reconstruction
 
-This repository reconstructs the **Population Development Dataset** for the paper:
-*"A Physiologically-Constrained Neural Network Digital Twin Framework for Replicating Glucose Dynamics in Type 1 Diabetes"* (arXiv:2508.05705v1).
+## Overview
 
-## Objective
-To create an auditable, deterministic, scientifically defensible dataset-generation pipeline consistent with:
-1. The paper's methodology.
-2. The released T1DSim_AI model artifacts.
-3. The legacy Resalat/OHSU reference model code (read-only evidence).
+This repository contains the reconstructed dataset generator and validation suite for the paper:
+*A Physiologically-Constrained Neural Network Digital Twin Framework for Replicating Glucose Dynamics in Type 1 Diabetes* (arXiv:2508.05705v1).
 
-## Workflow
+The core of this repository reconstructs the 10-state Hovorka-based ODE simulator (`T1DSim_ODE`) used by the authors to generate their population dataset (`D^P`).
 
-1.  **Raw T1DEXI Extraction:** Extract raw data using `build_day_scenario_library_v4.py` and `build_midnight_cgm_stats_v4.py`.
-2.  **Validation & Provenance:** Verify the `day_scenario_library.csv` and `midnight_cgm_stats.csv` against their JSON manifests.
-3.  **Generator & Splits:** Run `generate_population_dataset.m` (MATLAB) to assemble the dataset. The generator guarantees deterministic, leakage-safe Train/Val/Test splits by construction.
-4.  **Pilot Generation:** Run a small scale generation (e.g. `num_scenarios=50`) and confirm output dimensions using `test_sample.m`.
-5.  **ODE Baseline Evaluation:** Analyze the generated test set with `dataset_baseline.py` using 5-hour Kovatchev windows.
-6.  **Statistical Fingerprint:** Use `dataset_fingerprint.py` to compare dataset scale properties.
-7.  **Candidate Full Generation:** Once approved, deploy full generation on HPC.
-8.  **NN Retraining:** Proceed to train the neural network solely upon a successfully validated full dataset.
+## Repository Status
 
-## Repository Structure
+- **Dataset reconstruction is still under validation.** This is an independent reproduction effort.
+- **This is not claimed to be an exact author dataset.** We have rigorously reverse-engineered the reported parameters and assumptions, but some exact seed states and bounds remain unpublished.
+- **Unresolved assumptions are documented** in `docs/REPRODUCTION_ASSUMPTIONS.md`.
 
-*   `generate_population_dataset.m`: The primary MATLAB generator script.
-*   `load_day_scenario_library.m` & `load_midnight_cgm_stats.m`: Strongly typed CSV loaders.
-*   `dataset_baseline.py`: Python evaluator for computing TIR, TAR, TBR, LBGI, HBGI, and MG on the final dataset traces.
-*   `dataset_fingerprint.py`: Script to generate distribution statistics before NN training.
-*   `REPRODUCTION_ASSUMPTIONS.md`: Explicit registry of scientifically unresolved choices and parameters.
-*   `REFERENCE_CODE_AUDIT.md`: Historical bugs and anomalies in the author's legacy reference code.
-*   `Common/`, `Single Hormone Population/`, `Dual Hormone Population/`: Legacy reference directories (Read-Only).
+## Repository Layout
 
-> **Note on Documentation:** Older documentation (such as `generate_population_dataset_explained.pdf`) may describe historical implementation details. Refer to the active scripts and Markdown files for the current true behavior.
+- `matlab/` - The active dataset generator MATLAB scripts.
+- `scripts/` - Python data-building and dataset evaluation scripts.
+- `data/inputs/` - The preprocessed T1DEXI day-scenario and midnight-CGM source data inputs.
+- `tests/` - Python unit tests and the MATLAB 50-scenario smoke test.
+- `reference/` - Unmodified legacy reference code (Resalat et al. / Hovorka) provided as scientific historical evidence.
+- `docs/` - Assumptions and reference-code audit history.
+
+## Reproduction Workflow
+
+1. **Build source CSVs:** Parse the original clinical data (already provided in `data/inputs/`).
+2. **Run small MATLAB smoke test:** Test the ODE simulator generator on 50 scenarios before deploying.
+3. **Scientific pilot:** Generate a 500-1000 scenario dataset to verify output distributions.
+4. **Evaluate ODE baseline:** Run `dataset_baseline.py` to compare standard glycemic risk metrics against the paper's reported values.
+5. **Inspect fingerprint:** Compare structural IQR metrics using `dataset_fingerprint.py`.
+6. **Full dataset generation:** Only execute the full 46,200 trace generation across HPC nodes once the pilot validates properly.
+7. **Model Training:** Occurs in a separate repository containing the Neural Network implementation.
+
+## Requirements
+
+- Python 3.9+ (numpy, scipy, pandas, h5py)
+- MATLAB (Required for dataset generation, but *not* strictly required for the Python evaluator if given a generated `.mat` file).
+
+*Note: MATLAB is not required to run the Python validation suite.*
+
+## Quick Start
+
+### 1. Run the MATLAB Smoke Test
+```bash
+matlab -batch "run('tests/matlab/test_sample.m')"
+```
+
+### 2. Evaluate Glycemic Baselines
+```bash
+python scripts/dataset_baseline.py --dataset test_sample_dataset.mat
+```
+
+## Scientific Assumptions
+For a full list of confirmed vs. unresolved scientific parameters, please see:
+[REPRODUCTION_ASSUMPTIONS.md](docs/REPRODUCTION_ASSUMPTIONS.md)
+
+## Reference Code
+The original simulator implementations from Resalat et al. and the dual/single hormone VPPs are preserved without modification in the `reference/` directory for provenance and code-auditing purposes. See [REFERENCE_CODE_AUDIT.md](docs/REFERENCE_CODE_AUDIT.md) for known legacy bugs and notes.
+
+## Validation
+To validate the evaluation suite itself:
+```bash
+python -m unittest discover tests
+```
+
+## Known Limitations
+- The exact authors' base-scenario count pre-augmentation was not published.
+- The exact deterministic thresholds for bolus perturbations are undocumented.
+- Full production out-of-core generation via HDF5 block-streaming is not yet fully integrated; the current implementation generates temporary MAT chunks which are then stitched in memory (requiring >16GB RAM for the full 46,200 cohort).

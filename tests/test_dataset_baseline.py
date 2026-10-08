@@ -3,7 +3,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import unittest
-from dataset_baseline import window_outcomes_batch, WelfordAccumulator
+from scripts.dataset_baseline import window_outcomes_batch, WelfordAccumulator
 import numpy as np
 
 class TestDatasetBaseline(unittest.TestCase):
