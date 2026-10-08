@@ -126,26 +126,35 @@ function [dataset, meta] = generate_population_dataset(varargin)
     cgm_map  = load_midnight_cgm_stats(opts.cgm_csv_path);
     n_library = numel(meal_lib);
 
-    % [BUG FIX + RECONSTRUCTION A2] Day-level leakage-free split.
-    % Partition the set of ALL unique day_ids into disjoint train/val/test
-    % pools ONCE globally, BEFORE workload partitioning, so that every
-    % member uses the same mapping and no individual day_id leaks across
-    % splits. The paper says "60/20/20 split" but does not specify the
-    % grouping unit; standard ML practice requires no data leakage.
+    % [BUG FIX] Leakage-Free Splitting By Construction
+    % Partition the UNIQUE daily meal scenarios into three disjoint pools ONCE
+    % globally, BEFORE workload partitioning.
     all_day_ids = unique([meal_lib.day_id]);
     n_unique_days = numel(all_day_ids);
     split_rng = RandStream('twister', 'Seed', opts.random_seed);
-    day_perm = all_day_ids(split_rng.randperm(n_unique_days));
+    day_perm = split_rng.randperm(n_unique_days);
+    
     n_train_days = round(opts.split_ratio(1) * n_unique_days);
     n_val_days   = round(opts.split_ratio(2) * n_unique_days);
-    train_day_set = containers.Map(num2cell(double(day_perm(1:n_train_days))), ...
-                                   num2cell(ones(1, n_train_days)));
-    val_day_set   = containers.Map(num2cell(double(day_perm(n_train_days+1 : n_train_days+n_val_days))), ...
-                                   num2cell(ones(1, n_val_days)));
-    test_day_set  = containers.Map(num2cell(double(day_perm(n_train_days+n_val_days+1 : end))), ...
-                                   num2cell(ones(1, n_unique_days - n_train_days - n_val_days)));
-    fprintf('  Day-level split: %d train / %d val / %d test day_ids (of %d unique)\n', ...
+    
+    % Get actual indices in meal_lib for each pool
+    train_pool_idx = find(ismember([meal_lib.day_id], all_day_ids(day_perm(1:n_train_days))));
+    val_pool_idx   = find(ismember([meal_lib.day_id], all_day_ids(day_perm(n_train_days+1 : n_train_days+n_val_days))));
+    test_pool_idx  = find(ismember([meal_lib.day_id], all_day_ids(day_perm(n_train_days+n_val_days+1 : end))));
+    
+    fprintf('  Day-level pools: %d Train / %d Val / %d Test day_ids (of %d unique)\n', ...
             n_train_days, n_val_days, n_unique_days - n_train_days - n_val_days, n_unique_days);
+
+    % Pre-assign each of the `opts.num_scenarios` base scenarios to a split (60/20/20)
+    base_scen_split = zeros(1, opts.num_scenarios, 'uint8');
+    n_train_scen = round(opts.split_ratio(1) * opts.num_scenarios);
+    n_val_scen   = round(opts.split_ratio(2) * opts.num_scenarios);
+    base_scen_split(1:n_train_scen) = 1;
+    base_scen_split(n_train_scen+1 : n_train_scen+n_val_scen) = 2;
+    base_scen_split(n_train_scen+n_val_scen+1 : end) = 3;
+    
+    % Shuffle this assignment vector using the same RNG so they are distributed across chunks
+    base_scen_split = base_scen_split(split_rng.randperm(opts.num_scenarios));
 
     %% --- 3. Population Model Parameters (Resalat et al. [12] / Hovorka et al. [35]) --
     ModPar = struct();
@@ -208,6 +217,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
         tir_vec     = zeros(1, max_alloc, 'single');
         mg_vec      = zeros(1, max_alloc, 'single');
         rare_vec    = false(1, max_alloc);
+        split_vec   = zeros(1, max_alloc, 'uint8');
 
         trace_count = 0;
 
@@ -272,6 +282,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
                 tir_vec(trace_count)        = single(tir);
                 mg_vec(trace_count)         = single(mean_cgm);
                 rare_vec(trace_count)       = false;
+                split_vec(trace_count)      = split_lbl;
 
                 if opts.include_rare_events
                     % [RECONSTRUCTION A7] The paper specifies only TBR > 20%
@@ -296,6 +307,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
                         tir_vec(trace_count)        = single(mean(CGM_supp >= 70 & CGM_supp <= 180) * 100);
                         mg_vec(trace_count)         = single(mean(CGM_supp));
                         rare_vec(trace_count)       = true;
+                        split_vec(trace_count)      = split_lbl;
                     end
 
                     if tar250 > 40
@@ -336,6 +348,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
         chunk_pack.tir_vec     = tir_vec(1:trace_count);
         chunk_pack.mg_vec      = mg_vec(1:trace_count);
         chunk_pack.rare_vec    = rare_vec(1:trace_count);
+        chunk_pack.split_vec   = split_vec(1:trace_count);
 
         safe_save_matlab_drive(chunk_file, chunk_pack);
         t_chunk = toc(t_start_chunk);
@@ -361,15 +374,18 @@ function [dataset, meta] = generate_population_dataset(varargin)
     end
     n_files = numel(chunk_files);
 
-    % ---- Pass 1: Scan chunk metadata (trace counts, metrics, day_ids) ----
+    % ---- Pass 1: Scan chunk metadata (trace counts, metrics, splits, day_ids) ----
     chunk_counts   = zeros(1, n_files);
     all_tir        = [];
     all_tar        = [];
     all_tbr        = [];
     all_mg         = [];
     all_day_ids_chunks = {};
+    all_split_lbls = {};
+    all_rare_vec   = {};
+    all_gid_vec    = {};
 
-    fprintf('  Pass 1/2: scanning chunk metadata for day-level splitting ...\n');
+    fprintf('  Pass 1/2: scanning chunk metadata for validation ...\n');
     for k = 1:n_files
         cpath = get_chunk_file_path(chunk_dir, chunk_files(k).name);
         info = whos('-file', cpath, 'CGM_mat');
@@ -382,8 +398,12 @@ function [dataset, meta] = generate_population_dataset(varargin)
         end
         chunk_counts(k) = cnt;
 
-        cdata = load(cpath, 'day_ids_mat', 'tir_vec', 'tar_vec', 'tbr_vec', 'mg_vec');
+        cdata = load(cpath, 'day_ids_mat', 'tir_vec', 'tar_vec', 'tbr_vec', 'mg_vec', 'split_vec', 'rare_vec', 'gid_vec');
         all_day_ids_chunks{k} = cdata.day_ids_mat(:, 1:cnt); %#ok<AGROW>
+        all_split_lbls{k} = cdata.split_vec(1:cnt); %#ok<AGROW>
+        all_rare_vec{k}   = cdata.rare_vec(1:cnt); %#ok<AGROW>
+        all_gid_vec{k}    = cdata.gid_vec(1:cnt); %#ok<AGROW>
+        
         all_tir = [all_tir, cdata.tir_vec(1:cnt)]; %#ok<AGROW>
         all_tar = [all_tar, cdata.tar_vec(1:cnt)]; %#ok<AGROW>
         all_tbr = [all_tbr, cdata.tbr_vec(1:cnt)]; %#ok<AGROW>
@@ -395,39 +415,46 @@ function [dataset, meta] = generate_population_dataset(varargin)
     total_traces   = n_total_traces;
     total_sim_days = total_traces * opts.days_per_scenario;
 
-    % ---- [RECONSTRUCTION A2] Day-Level Leakage-Free Splitting ----
-    % Each trace is assigned to the split that contains ALL of its 7 day_ids.
-    % If a trace's day_ids span multiple splits, it goes to TRAIN (the most
-    % conservative choice, preventing contamination of val/test).
-    split_labels = zeros(1, n_total_traces, 'uint8');  % 1=train, 2=val, 3=test
-    trace_offset = 0;
-    for k = 1:n_files
-        cnt = chunk_counts(k);
-        chunk_days = all_day_ids_chunks{k};
-        for j = 1:cnt
-            ids = double(chunk_days(:, j));
-            in_train = all(cellfun(@(id) train_day_set.isKey(id), num2cell(ids)));
-            in_val   = all(cellfun(@(id) val_day_set.isKey(id), num2cell(ids)));
-            in_test  = all(cellfun(@(id) test_day_set.isKey(id), num2cell(ids)));
-            if in_test
-                split_labels(trace_offset + j) = 3;
-            elseif in_val
-                split_labels(trace_offset + j) = 2;
-            elseif in_train
-                split_labels(trace_offset + j) = 1;
-            else
-                % Mixed day_ids across splits → assign to train
-                split_labels(trace_offset + j) = 1;
-            end
-        end
-        trace_offset = trace_offset + cnt;
-    end
+    % Concatenate metadata
+    split_labels = [all_split_lbls{:}];
+    rare_labels  = [all_rare_vec{:}];
+    global_gids  = [all_gid_vec{:}];
+    day_ids_flat = cat(2, all_day_ids_chunks{:});
 
+    % ---- HARD ASSERTIONS: Validate Leakage-Free Split ----
+    train_days_used = unique(day_ids_flat(:, split_labels == 1));
+    val_days_used   = unique(day_ids_flat(:, split_labels == 2));
+    test_days_used  = unique(day_ids_flat(:, split_labels == 3));
+    
+    if ~isempty(intersect(train_days_used, val_days_used))
+        error('LEAKAGE DETECTED: Train and Val sets share daily scenarios!');
+    end
+    if ~isempty(intersect(train_days_used, test_days_used))
+        error('LEAKAGE DETECTED: Train and Test sets share daily scenarios!');
+    end
+    if ~isempty(intersect(val_days_used, test_days_used))
+        error('LEAKAGE DETECTED: Val and Test sets share daily scenarios!');
+    end
+    fprintf('  Hard Assertions Passed: Zero leakage between splits.\n');
+
+    % ---- ACCOUNTING METADATA ----
+    base_scenarios           = numel(unique(global_gids));
+    standard_variant_traces  = sum(~rare_labels);
+    supplemental_rare_traces = sum(rare_labels);
+    final_total_traces       = numel(rare_labels);
+    
+    fprintf('  Accounting:\n');
+    fprintf('    Requested Base Scenarios : %d\n', opts.num_scenarios);
+    fprintf('    Generated Base Scenarios : %d\n', base_scenarios);
+    fprintf('    Standard Variant Traces  : %d\n', standard_variant_traces);
+    fprintf('    Supplemental Rare Traces : %d\n', supplemental_rare_traces);
+    fprintf('    FINAL TOTAL TRACES       : %d\n', final_total_traces);
+    
     n_train = sum(split_labels == 1);
     n_val   = sum(split_labels == 2);
     n_test  = sum(split_labels == 3);
-    fprintf('  Split: %d train (60%%) / %d val (20%%) / %d test (20%%) [%d total traces]\n', ...
-            n_train, n_val, n_test, n_total_traces);
+    fprintf('  Split: %d train (%.1f%%) / %d val (%.1f%%) / %d test (%.1f%%)\n', ...
+            n_train, 100*n_train/n_total_traces, n_val, 100*n_val/n_total_traces, n_test, 100*n_test/n_total_traces);
 
     % ---- Preallocate D_train, D_val, D_test (No redundant X_all!) ----
     D_train = struct();
@@ -588,7 +615,10 @@ function [dataset, meta] = generate_population_dataset(varargin)
     meta.start_scen_idx = start_scen_idx;
     meta.end_scen_idx   = end_scen_idx;
     meta.num_scenarios  = n_scenarios;
-    meta.total_traces   = total_traces;
+    meta.base_scenarios = base_scenarios;
+    meta.standard_variant_traces = standard_variant_traces;
+    meta.supplemental_rare_traces = supplemental_rare_traces;
+    meta.final_total_traces = final_total_traces;
     meta.n_train = n_train;
     meta.n_val   = n_val;
     meta.n_test  = n_test;
@@ -769,6 +799,9 @@ function [u_carbs_grid, u_insulin_grid] = build_scenario_inputs(...
             bolus_time_min = meal_time_min + delay_min;
             step_bolus = max(1, min(N_steps, round(bolus_time_min / Ts) + 1));
 
+            % [RECONSTRUCTION A5] The paper says bolus size was varied for
+            % under/over-dosing but does not specify the range or method.
+            % The factor is applied to ICR, which causes asymmetric dose scaling.
             dosing_factor = 0.85 + 0.3 * rand();
             icr = ICR_base * dosing_factor;
 
