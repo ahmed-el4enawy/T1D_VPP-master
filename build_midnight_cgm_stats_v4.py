@@ -296,10 +296,21 @@ def cross_check_meal_library(stats: pd.DataFrame, lib_path: str) -> None:
         print("     for meal scenarios.")
 
 
+import argparse
+import json
+import os
+
 if __name__ == "__main__":
-    xpt_in = sys.argv[1]
-    csv_out = sys.argv[2] if len(sys.argv) > 2 else "midnight_cgm_stats.csv"
-    lib_in = sys.argv[3] if len(sys.argv) > 3 else None
+    parser = argparse.ArgumentParser(description="Build midnight CGM stats from T1DEXI LB.xpt")
+    parser.add_argument("xpt_in", type=str, help="Input LB.xpt file")
+    parser.add_argument("csv_out", type=str, nargs='?', default="midnight_cgm_stats.csv", help="Output CSV file")
+    parser.add_argument("lib_in", type=str, nargs='?', default=None, help="Optional day_scenario_library.csv for cross-check")
+    parser.add_argument("--manifest", type=str, default="midnight_cgm_stats_manifest.json", help="Output JSON manifest")
+    args = parser.parse_args()
+
+    xpt_in = args.xpt_in
+    csv_out = args.csv_out
+    lib_in = args.lib_in
 
     cgm = extract_cgm_events(xpt_in)
     stats, pooled = build_midnight_stats(cgm)
@@ -331,3 +342,15 @@ if __name__ == "__main__":
 
     if lib_in:
         cross_check_meal_library(stats, lib_in)
+        
+    # Save manifest
+    manifest = {
+        "file": csv_out,
+        "rows": len(stats),
+        "size_bytes": os.path.getsize(csv_out),
+        "pooled_mean": pm,
+        "pooled_std": ps
+    }
+    with open(args.manifest, 'w') as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Saved manifest to {args.manifest}")

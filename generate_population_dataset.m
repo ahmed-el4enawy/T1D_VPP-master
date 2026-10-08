@@ -233,6 +233,8 @@ function [dataset, meta] = generate_population_dataset(varargin)
         split_vec   = zeros(1, max_alloc, 'uint8');
 
         trace_count = 0;
+        fallback_cgm_count = 0;
+        mixed_participant_count = 0;
 
         for s_idx = c_start_scen:c_end_scen
             global_scen_id = start_scen_idx + s_idx - 1;
@@ -244,6 +246,8 @@ function [dataset, meta] = generate_population_dataset(varargin)
             end
 
             split_lbl = base_scen_split(global_scen_id);
+            
+            scen_rng = RandStream('twister', 'Seed', opts.random_seed + global_scen_id);
             
             switch split_lbl
                 case 1
@@ -257,9 +261,15 @@ function [dataset, meta] = generate_population_dataset(varargin)
                           'Undefined split_lbl %d', split_lbl);
             end
 
-            day_indices = pool_idx(randi(numel(pool_idx), 1, opts.days_per_scenario));
+            day_indices = pool_idx(randi(scen_rng, numel(pool_idx), 1, opts.days_per_scenario));
             selected_days = meal_lib(day_indices);
             day_ids = int16([selected_days.day_id]);
+            
+            usubjids_in_trace = unique(string([selected_days.usubjid]));
+            if numel(usubjids_in_trace) > 1
+                mixed_participant_count = mixed_participant_count + 1;
+            end
+            
             % [RECONSTRUCTION A3] When the 7 sampled days come from different
             % participants, the initial glucose distribution is drawn from
             % the first day's participant. The paper does not specify which
@@ -273,9 +283,10 @@ function [dataset, meta] = generate_population_dataset(varargin)
             else
                 cgm_mean = 156.0;
                 cgm_std  = 45.0;
+                fallback_cgm_count = fallback_cgm_count + 1;
             end
 
-            initial_cgm_draws = cgm_mean + cgm_std * randn(1, n_variants);
+            initial_cgm_draws = cgm_mean + cgm_std * randn(scen_rng, 1, n_variants);
             % [RECONSTRUCTION A6] The paper does not mention clipping.
             % This bounds the normal distribution to [70, 260] mg/dL.
             initial_cgm_draws = max(70, min(260, initial_cgm_draws));
@@ -292,7 +303,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
                 icr_base = 1700.0 / (tdd_est * 3.0);
 
                 [u_carbs_grid, u_insulin_grid] = build_scenario_inputs(...
-                    selected_days, Sim_time_min, Ts, ModPar.Weight, icr_base);
+                    selected_days, Sim_time_min, Ts, ModPar.Weight, icr_base, false, scen_rng);
 
                 [X_trace, U_trace, CGM_trace] = simulate_7day_ode_fast(...
                     x0, u_carbs_grid, u_insulin_grid, basal_Uhr, ModPar, N_steps, Ts, dt_sub, sub_steps_per_frame);
@@ -345,7 +356,7 @@ function [dataset, meta] = generate_population_dataset(varargin)
 
                     if tar250 > 40
                         [u_carbs_del, u_ins_del] = build_scenario_inputs(...
-                            selected_days, Sim_time_min, Ts, ModPar.Weight, icr_base, true);
+                            selected_days, Sim_time_min, Ts, ModPar.Weight, icr_base, true, scen_rng);
                         
                         [x0_hyper, ~, basal_hyper] = solve_steady_state(g0 * 1.15, ModPar);
                         [X_supp, U_supp, CGM_supp] = simulate_7day_ode_fast(...
@@ -383,8 +394,13 @@ function [dataset, meta] = generate_population_dataset(varargin)
         chunk_pack.mg_vec      = mg_vec(1:trace_count);
         chunk_pack.rare_vec    = rare_vec(1:trace_count);
         chunk_pack.split_vec   = split_vec(1:trace_count);
+        chunk_pack.fallback_cgm_count = fallback_cgm_count;
+        chunk_pack.mixed_participant_count = mixed_participant_count;
 
-        safe_save_matlab_drive(chunk_file, chunk_pack);
+        % Use temporary extension then atomic move
+        tmp_chunk_file = [chunk_file, '.tmp.mat'];
+        save(tmp_chunk_file, '-struct', 'chunk_pack', '-v7');
+        movefile(tmp_chunk_file, chunk_file);
         t_chunk = toc(t_start_chunk);
 
         fprintf('     Saved Chunk %d in %.1fs (%d traces, ~35 MB). RAM cleared.\n', ...
@@ -418,6 +434,9 @@ function [dataset, meta] = generate_population_dataset(varargin)
     all_split_lbls = {};
     all_rare_vec   = {};
     all_gid_vec    = {};
+    
+    total_fallback_cgm = 0;
+    total_mixed_participants = 0;
 
     fprintf('  Pass 1/2: scanning chunk metadata for validation ...\n');
     for k = 1:n_files
@@ -432,7 +451,15 @@ function [dataset, meta] = generate_population_dataset(varargin)
         end
         chunk_counts(k) = cnt;
 
-        cdata = load(cpath, 'day_ids_mat', 'tir_vec', 'tar_vec', 'tbr_vec', 'mg_vec', 'split_vec', 'rare_vec', 'gid_vec');
+        cdata = load(cpath, 'day_ids_mat', 'tir_vec', 'tar_vec', 'tbr_vec', 'mg_vec', 'split_vec', 'rare_vec', 'gid_vec', 'fallback_cgm_count', 'mixed_participant_count');
+        
+        if isfield(cdata, 'fallback_cgm_count')
+            total_fallback_cgm = total_fallback_cgm + cdata.fallback_cgm_count;
+        end
+        if isfield(cdata, 'mixed_participant_count')
+            total_mixed_participants = total_mixed_participants + cdata.mixed_participant_count;
+        end
+        
         all_day_ids_chunks{k} = cdata.day_ids_mat(:, 1:cnt); %#ok<AGROW>
         all_split_lbls{k} = cdata.split_vec(1:cnt); %#ok<AGROW>
         all_rare_vec{k}   = cdata.rare_vec(1:cnt); %#ok<AGROW>
@@ -494,6 +521,12 @@ function [dataset, meta] = generate_population_dataset(varargin)
     fprintf('  Split: %d train (%.1f%%) / %d val (%.1f%%) / %d test (%.1f%%)\n', ...
             n_train, 100*n_train/n_total_traces, n_val, 100*n_val/n_total_traces, n_test, 100*n_test/n_total_traces);
 
+    if n_total_traces > 10000
+        warning('generate_population_dataset:largeMemory', ...
+                'Assembling %d traces into RAM. This requires multiple GB. For production scale, an out-of-core HDF5 streaming strategy is required.', ...
+                n_total_traces);
+    end
+    
     % ---- Preallocate D_train, D_val, D_test (No redundant X_all!) ----
     D_train = struct();
     D_train.x        = zeros(N_steps, 10, n_train, 'single');
@@ -661,6 +694,16 @@ function [dataset, meta] = generate_population_dataset(varargin)
     meta.n_val   = n_val;
     meta.n_test  = n_test;
     meta.total_simulated_days = total_sim_days;
+    meta.fallback_cgm_count = total_fallback_cgm;
+    meta.mixed_participant_count = total_mixed_participants;
+    
+    if total_fallback_cgm > 0
+        warning('generate_population_dataset:cgmFallback', ...
+            '%d base scenarios used the pooled CGM fallback because participant-specific CGM stats were unavailable.', total_fallback_cgm);
+    end
+    if total_mixed_participants > 0
+        fprintf('  Note: %d base scenarios contained days from mixed participants.\n', total_mixed_participants);
+    end
     meta.clinical_outcomes = struct(...
         'TIR_mean_sd', sprintf('%.1f +/- %.1f%%', mean(all_tir), std(all_tir)), ...
         'TAR_mean_sd', sprintf('%.1f +/- %.1f%%', mean(all_tar), std(all_tar)), ...
@@ -805,9 +848,10 @@ end
 
 
 function [u_carbs_grid, u_insulin_grid] = build_scenario_inputs(...
-    selected_days, Sim_time_min, Ts, Weight, ICR_base, force_delays)
+    selected_days, Sim_time_min, Ts, Weight, ICR_base, force_delays, scen_rng)
 
     if nargin < 6, force_delays = false; end
+    if nargin < 7, scen_rng = RandStream('twister', 'Seed', 42); end
 
     N_steps = Sim_time_min / Ts;
     u_carbs_grid   = zeros(1, N_steps);
@@ -829,10 +873,10 @@ function [u_carbs_grid, u_insulin_grid] = build_scenario_inputs(...
             u_carbs_grid(step_meal) = u_carbs_grid(step_meal) + carb_g;
 
             if force_delays
-                delay_min = randi([15, 45]);
+                delay_min = randi(scen_rng, [15, 45]);
             else
                 delays = 0:5:45;
-                delay_min = delays(randi(numel(delays)));
+                delay_min = delays(randi(scen_rng, numel(delays)));
             end
             bolus_time_min = meal_time_min + delay_min;
             step_bolus = max(1, min(N_steps, round(bolus_time_min / Ts) + 1));
@@ -840,7 +884,7 @@ function [u_carbs_grid, u_insulin_grid] = build_scenario_inputs(...
             % [RECONSTRUCTION A5] The paper says bolus size was varied for
             % under/over-dosing but does not specify the range or method.
             % The factor is applied to ICR, which causes asymmetric dose scaling.
-            dosing_factor = 0.85 + 0.3 * rand();
+            dosing_factor = 0.85 + 0.3 * rand(scen_rng);
             icr = ICR_base * dosing_factor;
 
             bolus_U = carb_g / icr;
@@ -904,27 +948,5 @@ function cpath = get_chunk_file_path(chunk_dir, fname)
         cpath = fullfile(chunk_dir, fname);
     else
         cpath = fname;
-    end
-end
-
-
-function safe_save_matlab_drive(filepath, data_struct)
-    max_retries = 3;
-    for r = 1:max_retries
-        try
-            save(filepath, '-struct', 'data_struct', '-v7');
-            return;
-        catch ME
-            if r == max_retries
-                [~, fname, fext] = fileparts(filepath);
-                fallback_name = [fname, fext];
-                warning('generate_population_dataset:driveSaveFallback', ...
-                        'Drive path lock on %s. Saving to fallback: %s. Error: %s', ...
-                        filepath, fallback_name, ME.message);
-                save(fallback_name, '-struct', 'data_struct', '-v7');
-            else
-                pause(1.0);
-            end
-        end
     end
 end

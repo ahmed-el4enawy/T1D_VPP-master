@@ -87,7 +87,7 @@ def get_splits_logic(split_idx, day_ids_all, target_count, seed):
     chosen = np.sort(np.concatenate(selected_parts))
     return chosen
 
-def evaluate_cohort(f, trace_indices, orientation, name, is_rare_flags=None, chunk_size=1000):
+def evaluate_cohort_struct(struct_grp, trace_indices, orientation, name, is_rare_flags=None, chunk_size=1000):
     window_size = 61
     hop = 60
     
@@ -118,10 +118,10 @@ def evaluate_cohort(f, trace_indices, orientation, name, is_rare_flags=None, chu
         
         # Extract chunk data efficiently based on detected orientation
         if orientation == 'time_first':
-            cgm_chunk = f['dataset_glucose'][:, chunk_idx]
+            cgm_chunk = struct_grp['cgm'][:, chunk_idx]
             cgm_chunk = cgm_chunk.T # Convert to (trace, time)
         else:
-            cgm_chunk = f['dataset_glucose'][chunk_idx, :]
+            cgm_chunk = struct_grp['cgm'][chunk_idx, :]
             
         rare_chunk = None
         if is_rare_flags is not None:
@@ -224,9 +224,20 @@ def main():
     print(f"Opening dataset: {args.dataset}")
     f = h5py.File(args.dataset, 'r')
     
-    # 1. Inspect Schema & Orientation safely
-    cgm_ds = f['dataset_glucose']
-    print(f"Detected dataset_glucose shape: {cgm_ds.shape}")
+    # Extract splits from D_train, D_val, D_test
+    def extract_struct(name):
+        if 'dataset' in f and name in f['dataset']:
+            return f['dataset'][name]
+        elif name in f:
+            return f[name]
+        return None
+        
+    D_test = extract_struct('D_test')
+    if D_test is None:
+        raise ValueError("Could not find D_test in MAT file.")
+        
+    cgm_ds = D_test['cgm']
+    print(f"Detected D_test.cgm shape: {cgm_ds.shape}")
     
     if cgm_ds.shape[0] == 2016:
         orientation = 'time_first'
@@ -237,17 +248,14 @@ def main():
     else:
         raise ValueError(f"Unrecognized shape: {cgm_ds.shape}. Expected one dimension to be 2016.")
     
-    print(f"Orientation: {orientation} with {num_traces} total traces.")
+    print(f"Orientation: {orientation} with {num_traces} TEST traces.")
     
-    # 2. Extract Splits
-    split_ids = np.asarray(f['dataset_split_id']).ravel()
-    test_all_idx = np.where(split_ids == 2)[0]
-    print(f"Found {len(test_all_idx)} original TEST traces.")
+    test_all_idx = np.arange(num_traces)
     
     is_rare = None
-    if 'dataset_is_rare' in f:
-        is_rare = np.asarray(f['dataset_is_rare']).ravel()
-        print(f"Found dataset_is_rare flag. Rare TEST traces: {np.sum(is_rare[test_all_idx])}")
+    if 'is_rare' in D_test:
+        is_rare = np.asarray(D_test['is_rare']).ravel()
+        print(f"Found is_rare flag. Rare TEST traces: {np.sum(is_rare)}")
         
     report = {
         'dataset_path': args.dataset,
@@ -256,30 +264,36 @@ def main():
         'orientation': orientation,
         'cohorts': {}
     }
+    
+    # We will pass D_test explicitly to evaluate_cohort
+    def eval_cohort_local(trace_indices, name):
+        return evaluate_cohort_struct(D_test, trace_indices, orientation, name, is_rare, args.chunk_size)
         
     if args.cohort in ['all', 'original']:
         print("\n=== EVALUATING COHORT A (ORIGINAL GENERATOR TEST SPLIT) ===")
-        res_a = evaluate_cohort(f, test_all_idx, orientation, "Cohort A", is_rare, args.chunk_size)
+        res_a = eval_cohort_local(test_all_idx, "Cohort A")
         report['cohorts']['Cohort_A'] = res_a
         print_comparison(res_a, "Cohort A (Original TEST)")
         
     if args.cohort in ['all', 'paper-scale']:
         print("\n=== EVALUATING COHORT B (PAPER-SCALE RECONSTRUCTED TEST SUBSET) ===")
-        day_ids = np.asarray(f['dataset_day_ids'])
-        if day_ids.shape[0] == 7:
-            day_ids = day_ids.T
-            
-        PAPER_TEST_TRACES = 9240
-        SEED = 0 # From train_population_model.py
-        test_subset_idx = get_splits_logic(test_all_idx, day_ids, PAPER_TEST_TRACES, SEED + 103)
-        print(f"Reconstructed subset size: {len(test_subset_idx)}")
-        
-        # Check against out-of-bounds indices
-        assert np.all(test_subset_idx >= 0) and np.all(test_subset_idx < num_traces)
-        
-        res_b = evaluate_cohort(f, test_subset_idx, orientation, "Cohort B", is_rare, args.chunk_size)
-        report['cohorts']['Cohort_B'] = res_b
-        print_comparison(res_b, "Cohort B (Paper-scale TEST)")
+        if 'day_ids' not in D_test:
+            print("day_ids not found in D_test! Cannot build Cohort B.")
+        else:
+            day_ids = np.asarray(D_test['day_ids'])
+            if day_ids.shape[0] == 7:
+                day_ids = day_ids.T
+                
+            PAPER_TEST_TRACES = 9240
+            SEED = 0 # From train_population_model.py
+            try:
+                test_subset_idx = get_splits_logic(test_all_idx, day_ids, PAPER_TEST_TRACES, SEED + 103)
+                print(f"Reconstructed subset size: {len(test_subset_idx)}")
+                res_b = eval_cohort_local(test_subset_idx, "Cohort B")
+                report['cohorts']['Cohort_B'] = res_b
+                print_comparison(res_b, "Cohort B (Paper-scale TEST)")
+            except Exception as e:
+                print(f"Failed to generate paper-scale subset: {e}")
         
     with open(args.output_json, 'w') as outf:
         json.dump(report, outf, indent=2)

@@ -301,9 +301,19 @@ def percentile_report(raw: pd.DataFrame, label: str) -> None:
     print(f"  [{label}] mean carbs/day     : {raw['total_carbs'].mean():.0f} g")
 
 
+import argparse
+import json
+import os
+
 def main():
-    xpt_in = sys.argv[1]
-    csv_out = sys.argv[2] if len(sys.argv) > 2 else "day_scenario_library.csv"
+    parser = argparse.ArgumentParser(description="Build day scenario library from T1DEXI FAMLPM.xpt")
+    parser.add_argument("xpt_in", type=str, help="Input FAMLPM.xpt file")
+    parser.add_argument("csv_out", type=str, nargs='?', default="day_scenario_library.csv", help="Output CSV file")
+    parser.add_argument("--manifest", type=str, default="day_scenario_library_manifest.json", help="Output JSON manifest")
+    args = parser.parse_args()
+
+    xpt_in = args.xpt_in
+    csv_out = args.csv_out
 
     events = clean_events(extract_carb_events(xpt_in))
 
@@ -356,6 +366,17 @@ def main():
     print("this file, and day_id must stay equal to the row number. The MATLAB")
     print("loader asserts this. Keep the file under version control; do not")
     print("re-sort it by hand.")
+    
+    # Save manifest
+    manifest = {
+        "file": csv_out,
+        "rows": len(library),
+        "size_bytes": os.path.getsize(csv_out),
+        "participants": len(per_subj)
+    }
+    with open(args.manifest, 'w') as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Saved manifest to {args.manifest}")
 
 
 if __name__ == "__main__":

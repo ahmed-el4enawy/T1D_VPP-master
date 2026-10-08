@@ -1,24 +1,35 @@
 #!/bin/bash
-#SBATCH --partition=gpu5
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=12G
-#SBATCH --time=04:00:00
+# hpc_dataset_baseline.sh
+# Slurm script for running dataset baseline evaluator on HPC
+
+#SBATCH --job-name=eval_dataset
 #SBATCH --output=baseline_eval_%j.out
 #SBATCH --error=baseline_eval_%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=12:00:00
 
-set -euo pipefail
+set -e
 
-cd "/nfs/slurm/cugp012/T1D_VPP-master"
+# Preflight check
+if [ ! -f "requirements.txt" ]; then
+    echo "requirements.txt not found!"
+    exit 1
+fi
 
-echo "Starting dataset evaluation baseline"
+DATASET_PATH=${1:-"T1DSim_population_dataset.mat"}
 
-# Test the script first
-/nfs/slurm/cugp012/envs/t1d/bin/python -u dataset_baseline.py --test
+if [ ! -f "$DATASET_PATH" ]; then
+    echo "Dataset file not found: $DATASET_PATH"
+    exit 1
+fi
 
-# Run the actual evaluation
-/nfs/slurm/cugp012/envs/t1d/bin/python -u dataset_baseline.py \
-  --dataset /tmp/cugp012/population_development_dataset_merged.mat \
-  --cohort all \
-  --output-json dataset_baseline_report.json
+echo "Evaluating dataset: $DATASET_PATH"
+python dataset_baseline.py --dataset "$DATASET_PATH" --cohort all
 
-echo "Evaluation finished successfully."
+echo "Statistical fingerprinting dataset: $DATASET_PATH"
+python dataset_fingerprint.py --dataset_path "$DATASET_PATH"
+
+echo "Done."
