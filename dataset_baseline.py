@@ -6,16 +6,26 @@ import argparse
 import json
 import time
 
-def f_bg(bg):
+def window_outcomes_batch(bg):
     """
-    Kovatchev Risk transformation.
-    f(g) = 1.509 * ((ln(g))^1.084 - 5.381)
+    Exact mathematical port of the clinical outcomes from evaluate_population_model.py.
     """
-    # Defensive handling of invalid/zero glucose
-    bg = np.maximum(bg, 1.0)
-    val = np.log(bg)
-    val = np.maximum(val, 0.0)
-    return 1.509 * ((val**1.084) - 5.381)
+    TIR_LOW, TIR_HIGH = 70.0, 180.0
+    tir = 100.0 * np.mean((bg >= TIR_LOW) & (bg <= TIR_HIGH), axis=1)
+    tar = 100.0 * np.mean(bg > TIR_HIGH, axis=1)
+    tbr = 100.0 * np.mean(bg < TIR_LOW, axis=1)
+
+    bgc = np.clip(bg, 1.0, None)
+    f_bg = 1.509 * (np.log(bgc) ** 1.084 - 5.381)
+    r_bg = 10.0 * f_bg ** 2
+    neg = f_bg < 0
+    pos = ~neg
+    n = bg.shape[1]
+    lbgi = (r_bg * neg).sum(axis=1) / n
+    hbgi = (r_bg * pos).sum(axis=1) / n
+
+    return {"TIR": tir, "TAR": tar, "TBR": tbr, "LBGI": lbgi, "HBGI": hbgi, "MG": bg.mean(axis=1)}
+
 
 class WelfordAccumulator:
     """ Numerically stable streaming mean and sample standard deviation. """
@@ -144,19 +154,18 @@ def evaluate_cohort(f, trace_indices, orientation, name, is_rare_flags=None, chu
                 
                 total_windows += 1
                 
-                tir = np.mean((win >= 70) & (win <= 180)) * 100
-                tar = np.mean(win > 180) * 100
-                tbr = np.mean(win < 70) * 100
-                mg = np.mean(win)
+                win_2d = win[None, :]
+                out = window_outcomes_batch(win_2d)
+                
+                tir = out["TIR"][0]
+                tar = out["TAR"][0]
+                tbr = out["TBR"][0]
+                lbgi = out["LBGI"][0]
+                hbgi = out["HBGI"][0]
+                mg = out["MG"][0]
                 
                 # Sanity Check 1
                 assert np.isclose(tir + tar + tbr, 100.0), f"TIR+TAR+TBR={tir+tar+tbr}"
-                
-                fg = f_bg(win)
-                rg = 10 * (fg ** 2)
-                
-                lbgi = np.mean(np.where(fg < 0, rg, 0.0))
-                hbgi = np.mean(np.where(fg > 0, rg, 0.0))
                 
                 tir_acc.update([tir])
                 tar_acc.update([tar])
@@ -334,17 +343,50 @@ def run_tests():
     assert np.isclose(acc.get_std(), np.std(data, ddof=1))
     
     # 2. Risk metrics test (analytical)
-    fg = f_bg(np.array([100.0]))
-    assert fg < 0
+    bg_test = np.array([[100.0]])
+    out = window_outcomes_batch(bg_test)
+    assert out["LBGI"][0] > 0
+    assert out["HBGI"][0] == 0
     
     # 3. TIR/TAR/TBR sum test
-    win = np.array([65]*20 + [100]*21 + [200]*20)
-    assert len(win) == 61
-    tir = np.mean((win >= 70) & (win <= 180)) * 100
-    tar = np.mean(win > 180) * 100
-    tbr = np.mean(win < 70) * 100
+    win = np.array([[65]*20 + [100]*21 + [200]*20])
+    assert win.shape[1] == 61
+    out = window_outcomes_batch(win)
+    tir, tar, tbr = out["TIR"][0], out["TAR"][0], out["TBR"][0]
     assert np.isclose(tir + tar + tbr, 100.0)
     
+    # 4. Regression test against training_population's exact function
+    def original_window_outcomes_batch(bg):
+        # Literal copy from evaluate_population_model.py
+        tir = 100.0 * np.mean((bg >= 70.0) & (bg <= 180.0), axis=1)
+        tar = 100.0 * np.mean(bg > 180.0, axis=1)
+        tbr = 100.0 * np.mean(bg < 70.0, axis=1)
+
+        bgc = np.clip(bg, 1.0, None)
+        f_bg = 1.509 * (np.log(bgc) ** 1.084 - 5.381)
+        r_bg = 10.0 * f_bg ** 2
+        neg = f_bg < 0
+        pos = ~neg
+        n = bg.shape[1]
+        lbgi = (r_bg * neg).sum(axis=1) / n
+        hbgi = (r_bg * pos).sum(axis=1) / n
+
+        return {"TIR": tir, "TAR": tar, "TBR": tbr, "LBGI": lbgi, "HBGI": hbgi, "MG": bg.mean(axis=1)}
+
+    # Create a realistic shape batch (batch_size=2, window_len=61)
+    win_synth = np.array([
+        [60, 70, 80, 100, 150, 190, 250, 300]*7 + [100]*5, # 61 elements
+        [40]*61                                            # 61 elements
+    ], dtype=np.float64)
+    
+    orig_out = original_window_outcomes_batch(win_synth)
+    new_out = window_outcomes_batch(win_synth)
+    
+    for k in orig_out:
+        assert np.allclose(orig_out[k], new_out[k]), f"Mismatch in {k}: {orig_out[k]} vs {new_out[k]}"
+        
+    print("Regression test against training_population evaluate_population_model passed.")
+
     print("All unit tests passed.")
 
 if __name__ == '__main__':
