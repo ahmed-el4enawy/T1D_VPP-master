@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 import os
 import sys
 import h5py
@@ -5,6 +7,9 @@ import numpy as np
 import argparse
 import json
 import time
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / 'data' / 'inputs'
 
 def window_outcomes_batch(bg):
     """

@@ -11,8 +11,8 @@ function meal_lib = load_day_scenario_library(csv_path)
 %       time_min    - numeric row vector of per-meal times (minutes from midnight)
 %
 %   Asserts day_id == row index. Errors on any non-positive carb value.
-%   Matches normalise_id() in build_day_scenario_library_v4.py and
-%   build_midnight_cgm_stats_v4.py.
+%   Matches normalise_id() in build_day_scenario_library.py and
+%   build_midnight_cgm_stats.py.
 
     T = readtable(csv_path, 'TextType', 'string', 'Delimiter', ',');
 

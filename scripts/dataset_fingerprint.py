@@ -1,8 +1,13 @@
+import sys
+from pathlib import Path
 import argparse
 import json
 import os
 import numpy as np
 import h5py
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / 'data' / 'inputs'
 
 def reservoir_sample_chunked(h5_ds, sample_size, seed, is_time_first):
     """

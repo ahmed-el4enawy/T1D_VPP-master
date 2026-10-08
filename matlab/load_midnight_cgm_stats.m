@@ -9,7 +9,7 @@ function cgm_map = load_midnight_cgm_stats(csv_path)
 %       std   - midnight CGM standard deviation (mg/dL)
 %
 %   USUBJID normalisation matches normalise_id() in the Python build
-%   scripts (build_day_scenario_library_v4.py, build_midnight_cgm_stats_v4.py).
+%   scripts (build_day_scenario_library.py, build_midnight_cgm_stats.py).
 %
 %   The generator's existing fallback (cgm_mean=156, cgm_std=45) handles
 %   participants missing from this map; the loader does not replicate that.

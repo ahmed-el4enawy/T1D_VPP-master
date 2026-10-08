@@ -15,6 +15,11 @@ function [dataset, meta] = generate_population_dataset(varargin)
 %   - Member 3: generate_population_dataset('member_id', 3, 'total_members', 4) -> Part 3
 %   - Member 4: generate_population_dataset('member_id', 4, 'total_members', 4) -> Part 4
 
+
+    %% --- Path Resolution ---
+    this_dir = fileparts(mfilename('fullpath'));
+    repo_root = fileparts(this_dir);
+
     %% --- 1. Parse Input Options -----------------------------------------
     p = inputParser;
     addParameter(p, 'member_id', 1, @(x) isnumeric(x) && x > 0);
@@ -65,16 +70,16 @@ function [dataset, meta] = generate_population_dataset(varargin)
 
     %% --- 2. Load T1DEXI Meal Scenarios and Midnight CGM Stats -------------
     if isempty(opts.meal_csv_path)
-        if isfile(fullfile('..', 'data', 'inputs', 'day_scenario_library.csv'))
-            opts.meal_csv_path = fullfile('..', 'data', 'inputs', 'day_scenario_library.csv');
+        if isfile(fullfile(repo_root, 'data', 'inputs', 'day_scenario_library.csv'))
+            opts.meal_csv_path = fullfile(repo_root, 'data', 'inputs', 'day_scenario_library.csv');
         else
             error('generate_population_dataset:missingFile', 'data/inputs/day_scenario_library.csv not found.');
         end
     end
 
     if isempty(opts.cgm_csv_path)
-        if isfile(fullfile('..', 'data', 'inputs', 'midnight_cgm_stats.csv'))
-            opts.cgm_csv_path = fullfile('..', 'data', 'inputs', 'midnight_cgm_stats.csv');
+        if isfile(fullfile(repo_root, 'data', 'inputs', 'midnight_cgm_stats.csv'))
+            opts.cgm_csv_path = fullfile(repo_root, 'data', 'inputs', 'midnight_cgm_stats.csv');
         else
             error('generate_population_dataset:missingFile', 'data/inputs/midnight_cgm_stats.csv not found.');
         end

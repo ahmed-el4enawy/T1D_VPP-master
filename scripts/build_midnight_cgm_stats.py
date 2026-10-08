@@ -1,3 +1,8 @@
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / 'data' / 'inputs'
 """
 build_midnight_cgm_stats_v5.py
 
@@ -37,7 +42,7 @@ CHANGES vs v3
    the first line of the pilot. The CSV now carries both (identical
    values) so old and new loaders both work.
 
-3. USUBJID NORMALISATION, identical to build_day_scenario_library_v4.py
+3. USUBJID NORMALISATION, identical to build_day_scenario_library.py
    and load_midnight_cgm_stats.m. If pyreadstat returns USUBJID as
    numeric, one file can end up with "12.0" and the other with "12", in
    which case NO participant matches and every scenario silently falls

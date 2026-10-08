@@ -1,5 +1,10 @@
 import sys
+from pathlib import Path
+import sys
 import os
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / 'data' / 'inputs'
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import unittest

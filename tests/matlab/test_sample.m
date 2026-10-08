@@ -1,4 +1,6 @@
-addpath('../../matlab');
+this_dir = fileparts(mfilename('fullpath'));
+repo_root = fileparts(fileparts(this_dir));
+addpath(fullfile(repo_root, 'matlab'));
 % test_sample.m
 % Lightweight pilot runner for the population dataset generator.
 
